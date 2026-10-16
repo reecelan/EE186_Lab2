@@ -1,0 +1,115 @@
+/*
+ * EE186 Lab 2, Part 2
+ *
+ * B1 (USER) on PC13 -> SYSCFG mux -> EXTI line 13 (rising edge)
+ *   -> NVIC IRQ 40 (EXTI15_10) -> EXTI15_10_IRQHandler toggles LD2 (blue, PB7)
+ *
+ * No HAL. All addresses/offsets from RM0432 Rev 9:
+ *   Memory map  : Table 1 (Sec. 2.2.2)
+ *   RCC         : Sec. 6.4.17 (AHB2ENR @ 0x4C), 6.4.21 (APB2ENR @ 0x60)
+ *   GPIO        : Sec. 8.4
+ *   SYSCFG      : Sec. 9.2.6 (EXTICR4 @ 0x14)
+ *   EXTI        : Sec. 16.5 (IMR1 0x00, RTSR1 0x08, FTSR1 0x0C, PR1 0x14)
+ *   Vector table: Table 76, position 40 = EXTI15_10, vector address 0xE0
+ *   NVIC        : ARMv7-M ARM B3.4 (ISER0 @ 0xE000E100, ISER1 @ 0xE000E104)
+ */
+
+#include <stdint.h>
+
+#define REG(addr)       (*(volatile uint32_t *)(addr))
+
+/* ---------------- Peripheral base addresses ---------------- */
+#define RCC_BASE        0x40021000UL
+#define GPIOB_BASE      0x48000400UL
+#define GPIOC_BASE      0x48000800UL
+#define SYSCFG_BASE     0x40010000UL
+#define EXTI_BASE       0x40010400UL
+#define NVIC_ISER0_ADDR 0xE000E100UL
+
+/* ---------------- Registers ---------------- */
+#define RCC_AHB2ENR     REG(RCC_BASE    + 0x4C)
+#define RCC_APB2ENR     REG(RCC_BASE    + 0x60)
+
+#define GPIOB_MODER     REG(GPIOB_BASE  + 0x00)
+#define GPIOB_ODR       REG(GPIOB_BASE  + 0x14)
+
+#define GPIOC_MODER     REG(GPIOC_BASE  + 0x00)
+#define GPIOC_PUPDR     REG(GPIOC_BASE  + 0x0C)
+
+#define SYSCFG_EXTICR4  REG(SYSCFG_BASE + 0x14)
+
+#define EXTI_IMR1       REG(EXTI_BASE   + 0x00)
+#define EXTI_RTSR1      REG(EXTI_BASE   + 0x08)
+#define EXTI_FTSR1      REG(EXTI_BASE   + 0x0C)
+#define EXTI_PR1        REG(EXTI_BASE   + 0x14)
+
+/* ISERn covers IRQs 32n .. 32n+31 */
+#define NVIC_ISER(n)    REG(NVIC_ISER0_ADDR + 4U * (n))
+
+/* ---------------- Pins / bits ---------------- */
+#define GPIOBEN         (1U << 1)    /* RCC_AHB2ENR bit 1 */
+#define GPIOCEN         (1U << 2)    /* RCC_AHB2ENR bit 2 */
+#define SYSCFGEN        (1U << 0)    /* RCC_APB2ENR bit 0 */
+
+#define LED_BLUE        7U           /* PB7  = LD2 */
+#define BUTTON          13U          /* PC13 = B1  */
+
+#define EXTI15_10_IRQn  40U
+
+/* ---------------- ISR ----------------
+ * Name must exactly match the weak symbol in the startup_stm32l4r5*.s file,
+ * otherwise the linker keeps Default_Handler (an infinite loop).
+ */
+void EXTI15_10_IRQHandler(void)
+{
+    /* Lines 10..15 share this vector, so confirm it was line 13. */
+    if (EXTI_PR1 & (1U << BUTTON))
+    {
+        /* PR1 is rc_w1: write 1 to clear. Use '=' not '|=' : a read-modify-
+         * write would write 1s back to every pending line and clear them too.
+         * Clear first so the write reaches EXTI well before exception return. */
+        EXTI_PR1 = (1U << BUTTON);
+
+        GPIOB_ODR ^= (1U << LED_BLUE);
+    }
+}
+
+int main(void)
+{
+    /* 1. Clocks: GPIOB, GPIOC on AHB2; SYSCFG on APB2 */
+    RCC_AHB2ENR |= GPIOBEN | GPIOCEN;
+    RCC_APB2ENR |= SYSCFGEN;
+    (void)RCC_APB2ENR;               /* dummy read: RM0432 6.2.18 says wait
+                                        2 cycles after enabling a clock */
+
+    /* 2. PB7 -> general-purpose output (MODER7 = 01), start off */
+    GPIOB_MODER &= ~(3U << (2U * LED_BLUE));
+    GPIOB_MODER |=  (1U << (2U * LED_BLUE));
+    GPIOB_ODR   &= ~(1U << LED_BLUE);
+
+    /* 3. PC13 -> input (MODER13 = 00). Reset value is 11 (analog), which
+     *    disables the input Schmitt trigger, so EXTI would never see an edge.
+     *    No internal pull: the board's B1 circuit already defines the level. */
+    GPIOC_MODER &= ~(3U << (2U * BUTTON));
+    GPIOC_PUPDR &= ~(3U << (2U * BUTTON));
+
+    /* 4. SYSCFG: EXTI13 source = port C. EXTICR4 bits [7:4], 0010 = PC */
+    SYSCFG_EXTICR4 &= ~(0xFU << 4);
+    SYSCFG_EXTICR4 |=  (0x2U << 4);
+
+    /* 5. EXTI line 13: rising edge only (B1 is active-high on Nucleo-144),
+     *    clear any stale pending flag, then unmask */
+    EXTI_RTSR1 |=  (1U << BUTTON);
+    EXTI_FTSR1 &= ~(1U << BUTTON);
+    EXTI_PR1    =  (1U << BUTTON);
+    EXTI_IMR1  |=  (1U << BUTTON);
+
+    /* 6. NVIC: IRQ 40 -> ISER1 bit 8. ISER is write-1-to-set; 0s are ignored,
+     *    so a plain '=' cannot disable other IRQs. */
+    NVIC_ISER(EXTI15_10_IRQn / 32U) = (1U << (EXTI15_10_IRQn % 32U));
+
+    while (1)
+    {
+        /* Nothing to do: the CPU only leaves this loop when B1 interrupts it. */
+    }
+}
