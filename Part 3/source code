@@ -1,0 +1,157 @@
+/*
+ * EE186 Lab 2, Part 3: Timer interrupt
+ * Board: NUCLEO-L4R5ZI-P (STM32L4R5ZIT6P)
+ *
+ * TIM4 overflows once per second -> NVIC IRQ 30 -> TIM4_IRQHandler
+ * advances the LED sequence green (PC7) -> blue (PB7) -> red (PB14).
+ *
+ * Timer math (clock after reset: MSI = 4 MHz, AHB /1, APB1 /1):
+ *   f_CK_PSC  = 4 MHz          (APB1 prescaler = 1, so timer clock = PCLK1)
+ *   f_CK_CNT  = 4 MHz / (PSC+1) = 4 MHz / 4000 = 1 kHz   -> PSC = 3999
+ *   f_update  = 1 kHz / (ARR+1) = 1 kHz / 1000 = 1 Hz    -> ARR = 999
+ *
+ * No HAL. All addresses/offsets from RM0432 Rev 9:
+ *   Memory map  : Table 1 (TIM4 @ 0x40000800)
+ *   RCC         : 6.4.17 (AHB2ENR @ 0x4C), 6.4.19 (APB1ENR1 @ 0x58)
+ *   Timer clock : 6.2.14
+ *   TIM2..5     : 38.4 (CR1 0x00, DIER 0x0C, SR 0x10, EGR 0x14,
+ *                       PSC 0x28, ARR 0x2C)
+ *   Vector table: Table 76, position 30 = TIM4
+ *   NVIC        : ISER0 @ 0xE000E100
+ */
+
+#include <stdint.h>
+
+#define REG(addr)       (*(volatile uint32_t *)(addr))
+
+/* ---------------- Peripheral base addresses ---------------- */
+#define RCC_BASE        0x40021000UL
+#define GPIOB_BASE      0x48000400UL
+#define GPIOC_BASE      0x48000800UL
+#define TIM4_BASE       0x40000800UL
+#define NVIC_ISER0_ADDR 0xE000E100UL
+
+/* ---------------- Registers ---------------- */
+#define RCC_AHB2ENR     REG(RCC_BASE   + 0x4C)
+#define RCC_APB1ENR1    REG(RCC_BASE   + 0x58)
+
+#define GPIOB_MODER     REG(GPIOB_BASE + 0x00)
+#define GPIOB_BSRR      REG(GPIOB_BASE + 0x18)
+#define GPIOC_MODER     REG(GPIOC_BASE + 0x00)
+#define GPIOC_BSRR      REG(GPIOC_BASE + 0x18)
+
+#define TIM4_CR1        REG(TIM4_BASE  + 0x00)
+#define TIM4_DIER       REG(TIM4_BASE  + 0x0C)
+#define TIM4_SR         REG(TIM4_BASE  + 0x10)
+#define TIM4_EGR        REG(TIM4_BASE  + 0x14)
+#define TIM4_PSC        REG(TIM4_BASE  + 0x28)
+#define TIM4_ARR        REG(TIM4_BASE  + 0x2C)
+
+#define NVIC_ISER(n)    REG(NVIC_ISER0_ADDR + 4U * (n))
+
+/* ---------------- Bits ---------------- */
+#define GPIOBEN         (1U << 1)    /* RCC_AHB2ENR  */
+#define GPIOCEN         (1U << 2)    /* RCC_AHB2ENR  */
+#define TIM4EN          (1U << 2)    /* RCC_APB1ENR1 */
+
+#define TIM_CR1_CEN     (1U << 0)    /* counter enable          */
+#define TIM_DIER_UIE    (1U << 0)    /* update interrupt enable */
+#define TIM_SR_UIF      (1U << 0)    /* update interrupt flag   */
+#define TIM_EGR_UG      (1U << 0)    /* force an update event   */
+
+#define LED_GREEN       7U           /* PC7  = LD1 */
+#define LED_BLUE        7U           /* PB7  = LD2 */
+#define LED_RED         14U          /* PB14 = LD3 */
+
+#define TIM4_IRQn       30U
+
+#define TIM4_PSC_VALUE  3999U        /* 4 MHz / 4000 = 1 kHz counter */
+#define TIM4_ARR_VALUE  999U         /* 1 kHz / 1000 = 1 Hz update   */
+
+/* BSRR: writing bit n turns pin n ON, writing bit n+16 turns it OFF.
+ * Each write is a single store, so no read-modify-write is needed. */
+#define PIN_ON(n)       (1U << (n))
+#define PIN_OFF(n)      (1U << ((n) + 16U))
+
+/* ---------------- LED sequence ---------------- */
+enum { GREEN = 0, BLUE = 1, RED = 2, NUM_COLORS = 3 };
+
+/* Only the ISR touches this, so it doesn't need to be volatile yet.
+ * (In Part 4, anything shared between main and an ISR must be volatile.) */
+static uint32_t color = GREEN;
+
+static void show_color(uint32_t c)
+{
+    /* All three off, then the chosen one on. The off-time is a few
+     * nanoseconds, far too short to see. */
+    GPIOC_BSRR = PIN_OFF(LED_GREEN);
+    GPIOB_BSRR = PIN_OFF(LED_BLUE) | PIN_OFF(LED_RED);
+
+    switch (c)
+    {
+        case GREEN: GPIOC_BSRR = PIN_ON(LED_GREEN); break;
+        case BLUE:  GPIOB_BSRR = PIN_ON(LED_BLUE);  break;
+        case RED:   GPIOB_BSRR = PIN_ON(LED_RED);   break;
+        default:    break;
+    }
+}
+
+/* ---------------- ISR ----------------
+ * Name must exactly match the weak symbol in the startup_stm32l4r5*.s file.
+ */
+void TIM4_IRQHandler(void)
+{
+    if (TIM4_SR & TIM_SR_UIF)
+    {
+        /* UIF is rc_w0: write 0 to clear it, and 1s to every other flag so
+         * they're left alone. Avoid '&= ~': a flag that sets between the
+         * read and the write would be wiped out. */
+        TIM4_SR = ~TIM_SR_UIF;
+
+        color = (color + 1U) % NUM_COLORS;
+        show_color(color);
+    }
+}
+
+int main(void)
+{
+    /* 1. Clocks: GPIOB, GPIOC on AHB2; TIM4 on APB1 */
+    RCC_AHB2ENR  |= GPIOBEN | GPIOCEN;
+    RCC_APB1ENR1 |= TIM4EN;
+    (void)RCC_APB1ENR1;              /* dummy read: RM0432 6.2.18 says wait
+                                        2 cycles after enabling a clock */
+
+    /* 2. PC7, PB7, PB14 -> general-purpose outputs (MODER = 01) */
+    GPIOC_MODER &= ~(3U << (2U * LED_GREEN));
+    GPIOC_MODER |=  (1U << (2U * LED_GREEN));
+
+    GPIOB_MODER &= ~((3U << (2U * LED_BLUE)) | (3U << (2U * LED_RED)));
+    GPIOB_MODER |=   (1U << (2U * LED_BLUE)) | (1U << (2U * LED_RED));
+
+    show_color(color);               /* start on green */
+
+    /* 3. TIM4 time base: 1 kHz counter, overflow every 1000 counts */
+    TIM4_PSC = TIM4_PSC_VALUE;
+    TIM4_ARR = TIM4_ARR_VALUE;
+
+    /* PSC is buffered: the new value only takes effect at the next update
+     * event. Force one now with UG so the very first period is 1 s too
+     * (otherwise it would run at PSC = 0 and last only 250 us). */
+    TIM4_EGR = TIM_EGR_UG;
+
+    /* UG also sets UIF. Clear it, or the ISR fires immediately on enable
+     * and green gets skipped. */
+    TIM4_SR = ~TIM_SR_UIF;
+
+    /* 4. Interrupt path: timer -> NVIC (IRQ 30 -> ISER0 bit 30) */
+    TIM4_DIER |= TIM_DIER_UIE;
+    NVIC_ISER(TIM4_IRQn / 32U) = (1U << (TIM4_IRQn % 32U));
+
+    /* 5. Start counting */
+    TIM4_CR1 |= TIM_CR1_CEN;
+
+    while (1)
+    {
+        /* The CPU is free. All timing is done by TIM4 in hardware. */
+    }
+}
