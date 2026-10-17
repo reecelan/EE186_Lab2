@@ -1,0 +1,207 @@
+/*
+ * EE186 Lab 2, Part 4: Sorry to Interrupt!
+ * Board: NUCLEO-L4R5ZI-P (STM32L4R5ZIT6P)
+ *
+ * Normal:  TIM4 interrupts once per second and advances
+ *          green (PC7) -> blue (PB7) -> red (PB14).
+ * Pressed: holding B1 (PC13) freezes whichever LED is lit. TIM4 keeps
+ *          running and keeps interrupting, but the LED doesn't change.
+ * Release: the sequence resumes from the frozen color on the next tick.
+ *
+ * EXTI13 triggers on BOTH edges:
+ *   rising  edge (press)   -> button_held = 1
+ *   falling edge (release) -> button_held = 0
+ *
+ * No HAL. All addresses/offsets from RM0432 Rev 9:
+ *   RCC   : 6.4.17 AHB2ENR 0x4C, 6.4.19 APB1ENR1 0x58, 6.4.21 APB2ENR 0x60
+ *   GPIO  : 8.4 (MODER 0x00, PUPDR 0x0C, IDR 0x10, BSRR 0x18)
+ *   SYSCFG: 9.2.6 EXTICR4 0x14
+ *   EXTI  : 16.5 (IMR1 0x00, RTSR1 0x08, FTSR1 0x0C, PR1 0x14)
+ *   TIM2-5: 38.4 (CR1 0x00, DIER 0x0C, SR 0x10, EGR 0x14, PSC 0x28, ARR 0x2C)
+ *   Vector table (Table 76): TIM4 = 30, EXTI15_10 = 40
+ */
+
+#include <stdint.h>
+
+#define REG(addr)       (*(volatile uint32_t *)(addr))
+
+/* ---------------- Peripheral base addresses ---------------- */
+#define RCC_BASE        0x40021000UL
+#define GPIOB_BASE      0x48000400UL
+#define GPIOC_BASE      0x48000800UL
+#define SYSCFG_BASE     0x40010000UL
+#define EXTI_BASE       0x40010400UL
+#define TIM4_BASE       0x40000800UL
+#define NVIC_ISER0_ADDR 0xE000E100UL
+
+/* ---------------- Registers ---------------- */
+#define RCC_AHB2ENR     REG(RCC_BASE    + 0x4C)
+#define RCC_APB1ENR1    REG(RCC_BASE    + 0x58)
+#define RCC_APB2ENR     REG(RCC_BASE    + 0x60)
+
+#define GPIOB_MODER     REG(GPIOB_BASE  + 0x00)
+#define GPIOB_BSRR      REG(GPIOB_BASE  + 0x18)
+
+#define GPIOC_MODER     REG(GPIOC_BASE  + 0x00)
+#define GPIOC_PUPDR     REG(GPIOC_BASE  + 0x0C)
+#define GPIOC_IDR       REG(GPIOC_BASE  + 0x10)
+#define GPIOC_BSRR      REG(GPIOC_BASE  + 0x18)
+
+#define SYSCFG_EXTICR4  REG(SYSCFG_BASE + 0x14)
+
+#define EXTI_IMR1       REG(EXTI_BASE   + 0x00)
+#define EXTI_RTSR1      REG(EXTI_BASE   + 0x08)
+#define EXTI_FTSR1      REG(EXTI_BASE   + 0x0C)
+#define EXTI_PR1        REG(EXTI_BASE   + 0x14)
+
+#define TIM4_CR1        REG(TIM4_BASE   + 0x00)
+#define TIM4_DIER       REG(TIM4_BASE   + 0x0C)
+#define TIM4_SR         REG(TIM4_BASE   + 0x10)
+#define TIM4_EGR        REG(TIM4_BASE   + 0x14)
+#define TIM4_PSC        REG(TIM4_BASE   + 0x28)
+#define TIM4_ARR        REG(TIM4_BASE   + 0x2C)
+
+#define NVIC_ISER(n)    REG(NVIC_ISER0_ADDR + 4U * (n))
+
+/* ---------------- Bits ---------------- */
+#define GPIOBEN         (1U << 1)    /* RCC_AHB2ENR  */
+#define GPIOCEN         (1U << 2)    /* RCC_AHB2ENR  */
+#define TIM4EN          (1U << 2)    /* RCC_APB1ENR1 */
+#define SYSCFGEN        (1U << 0)    /* RCC_APB2ENR  */
+
+#define TIM_CR1_CEN     (1U << 0)
+#define TIM_DIER_UIE    (1U << 0)
+#define TIM_SR_UIF      (1U << 0)
+#define TIM_EGR_UG      (1U << 0)
+
+#define LED_GREEN       7U           /* PC7  = LD1 */
+#define LED_BLUE        7U           /* PB7  = LD2 */
+#define LED_RED         14U          /* PB14 = LD3 */
+#define BUTTON          13U          /* PC13 = B1, active-high */
+
+#define TIM4_IRQn       30U
+#define EXTI15_10_IRQn  40U
+
+#define TIM4_PSC_VALUE  3999U        /* 4 MHz / 4000 = 1 kHz counter */
+#define TIM4_ARR_VALUE  999U         /* 1 kHz / 1000 = 1 Hz update   */
+
+#define PIN_ON(n)       (1U << (n))
+#define PIN_OFF(n)      (1U << ((n) + 16U))
+
+/* ---------------- Shared state ---------------- */
+enum { GREEN = 0, BLUE = 1, RED = 2, NUM_COLORS = 3 };
+
+static uint32_t color = GREEN;       /* only TIM4_IRQHandler changes this */
+
+/* Written by the EXTI ISR, read by the TIM4 ISR (and set once in main).
+ * volatile: every access must really go to memory, never a cached copy. */
+static volatile uint32_t button_held = 0;
+
+static inline uint32_t button_is_down(void)
+{
+    return (GPIOC_IDR & (1U << BUTTON)) ? 1U : 0U;
+}
+
+static void show_color(uint32_t c)
+{
+    GPIOC_BSRR = PIN_OFF(LED_GREEN);
+    GPIOB_BSRR = PIN_OFF(LED_BLUE) | PIN_OFF(LED_RED);
+
+    switch (c)
+    {
+        case GREEN: GPIOC_BSRR = PIN_ON(LED_GREEN); break;
+        case BLUE:  GPIOB_BSRR = PIN_ON(LED_BLUE);  break;
+        case RED:   GPIOB_BSRR = PIN_ON(LED_RED);   break;
+        default:    break;
+    }
+}
+
+/* ---------------- Button ISR: runs on press AND release ---------------- */
+void EXTI15_10_IRQHandler(void)
+{
+    if (EXTI_PR1 & (1U << BUTTON))
+    {
+        /* 1. Clear first (rc_w1, plain '='). Any edge that happens after
+         *    this point re-pends the interrupt, so nothing is lost. */
+        EXTI_PR1 = (1U << BUTTON);
+
+        /* 2. EXTI doesn't record which edge fired, so read the pin to find
+         *    out: high = just pressed (rising), low = just released
+         *    (falling). Reading the real level also self-corrects if the
+         *    contacts bounce. */
+        button_held = button_is_down();
+    }
+}
+
+/* ---------------- Timer ISR: runs every second, always ---------------- */
+void TIM4_IRQHandler(void)
+{
+    if (TIM4_SR & TIM_SR_UIF)
+    {
+        /* Always clear the flag, even while the button is held. If you
+         * skipped this, the ISR would re-enter forever. */
+        TIM4_SR = ~TIM_SR_UIF;       /* rc_w0: write 0 to clear */
+
+        /* The timer keeps running; we just skip the color change. */
+        if (!button_held)
+        {
+            color = (color + 1U) % NUM_COLORS;
+            show_color(color);
+        }
+    }
+}
+
+int main(void)
+{
+    /* 1. Clocks */
+    RCC_AHB2ENR  |= GPIOBEN | GPIOCEN;
+    RCC_APB1ENR1 |= TIM4EN;
+    RCC_APB2ENR  |= SYSCFGEN;
+    (void)RCC_APB2ENR;               /* RM0432 6.2.18: wait 2 cycles */
+
+    /* 2. LEDs: PC7, PB7, PB14 as outputs */
+    GPIOC_MODER &= ~(3U << (2U * LED_GREEN));
+    GPIOC_MODER |=  (1U << (2U * LED_GREEN));
+
+    GPIOB_MODER &= ~((3U << (2U * LED_BLUE)) | (3U << (2U * LED_RED)));
+    GPIOB_MODER |=   (1U << (2U * LED_BLUE)) | (1U << (2U * LED_RED));
+
+    show_color(color);               /* start on green */
+
+    /* 3. Button: PC13 as input, no internal pull */
+    GPIOC_MODER &= ~(3U << (2U * BUTTON));
+    GPIOC_PUPDR &= ~(3U << (2U * BUTTON));
+
+    /* 4. Route PC13 -> EXTI13, trigger on BOTH edges */
+    SYSCFG_EXTICR4 &= ~(0xFU << 4);
+    SYSCFG_EXTICR4 |=  (0x2U << 4);  /* 0010 = port C */
+
+    EXTI_RTSR1 |= (1U << BUTTON);    /* rising  = press   */
+    EXTI_FTSR1 |= (1U << BUTTON);    /* falling = release */
+    EXTI_PR1    = (1U << BUTTON);    /* clear any stale flag */
+
+    /* In case the button is already down at power-up (no edge would tell us) */
+    button_held = button_is_down();
+
+    EXTI_IMR1  |= (1U << BUTTON);
+
+    /* 5. TIM4: 1 Hz update interrupt (same as Part 3) */
+    TIM4_PSC = TIM4_PSC_VALUE;
+    TIM4_ARR = TIM4_ARR_VALUE;
+    TIM4_EGR = TIM_EGR_UG;           /* load PSC now */
+    TIM4_SR  = ~TIM_SR_UIF;          /* clear the flag UG just set */
+    TIM4_DIER |= TIM_DIER_UIE;
+
+    /* 6. NVIC: both IRQs. Default priority is equal (0), so neither ISR
+     *    can interrupt the other; they just take turns. */
+    NVIC_ISER(TIM4_IRQn      / 32U) = (1U << (TIM4_IRQn      % 32U));
+    NVIC_ISER(EXTI15_10_IRQn / 32U) = (1U << (EXTI15_10_IRQn % 32U));
+
+    /* 7. Start the timer last */
+    TIM4_CR1 |= TIM_CR1_CEN;
+
+    while (1)
+    {
+        /* Everything happens in the two ISRs. */
+    }
+}
